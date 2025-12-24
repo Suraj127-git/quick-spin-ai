@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # QuickSpin AI API
+  quickspin-ai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - QUICKSPIN_API_URL=${QUICKSPIN_API_URL:-https://api.quickspin.io}
+      - QUICKSPIN_AUTH_URL=${QUICKSPIN_AUTH_URL:-https://auth.quickspin.io}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - GROQ_MODEL=${GROQ_MODEL:-mixtral-8x7b-32768}
+      - MONGODB_URI=mongodb://mongodb:27017/quickspin_ai
+      - MONGODB_DATABASE=quickspin_ai
+      - CHROMA_PERSIST_DIR=/data/chroma
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
+      - APP_ENV=development
+      - LOG_LEVEL=INFO
+    volumes:
+      - chroma_data:/data/chroma
+    depends_on:
+      - mongodb
+    networks:
+      - quickspin-ai-network
+
+  # MongoDB
+  mongodb:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - quickspin-ai-network
+
+volumes:
+  mongodb_data:
+  chroma_data:
+
+networks:
+  quickspin-ai-network:
+    driver: bridge

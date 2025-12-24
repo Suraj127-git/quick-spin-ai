@@ -1,0 +1,133 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quickspin-ai
+  namespace: quickspin-ai
+  labels:
+    app: quickspin-ai
+    app.kubernetes.io/name: quickspin-ai
+    app.kubernetes.io/component: ai-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: quickspin-ai
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero downtime
+  template:
+    metadata:
+      labels:
+        app: quickspin-ai
+        app.kubernetes.io/name: quickspin-ai
+        app.kubernetes.io/component: ai-service
+    spec:
+      serviceAccountName: quickspin-operator  # Reuse backend service account for K8s access
+      containers:
+        - name: quickspin-ai
+          image: registry.gitlab.com/quick-spin/quick-spin-ai:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            # Application Configuration
+            - name: APP_ENV
+              value: "production"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: API_PREFIX
+              value: "/api/v1"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: PORT
+              value: "8000"
+            - name: WORKERS
+              value: "2"
+
+            # AI Configuration
+            - name: GROQ_MODEL
+              value: "mixtral-8x7b-32768"
+
+            # Vector Store Configuration
+            - name: CHROMA_PERSIST_DIR
+              value: "/data/chroma"
+            - name: CHROMA_COLLECTION_NAME
+              value: "quickspin_knowledge"
+
+            # Secrets from ConfigMap/Secrets
+            - name: QUICKSPIN_API_URL
+              valueFrom:
+                secretKeyRef:
+                  name: quickspin-ai-secrets
+                  key: QUICKSPIN_API_URL
+            - name: QUICKSPIN_AUTH_URL
+              valueFrom:
+                secretKeyRef:
+                  name: quickspin-ai-secrets
+                  key: QUICKSPIN_AUTH_URL
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: quickspin-ai-secrets
+                  key: GROQ_API_KEY
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: quickspin-ai-secrets
+                  key: MONGODB_URI
+            - name: MONGODB_DATABASE
+              value: "quickspin_ai"
+            - name: JWT_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: quickspin-ai-secrets
+                  key: JWT_SECRET_KEY
+            - name: JWT_ALGORITHM
+              value: "HS256"
+            - name: K8S_IN_CLUSTER
+              valueFrom:
+                secretKeyRef:
+                  name: quickspin-ai-secrets
+                  key: K8S_IN_CLUSTER
+
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+
+          volumeMounts:
+            - name: chroma-data
+              mountPath: /data/chroma
+
+      volumes:
+        - name: chroma-data
+          persistentVolumeClaim:
+            claimName: quickspin-ai-chroma-pvc
+
+      imagePullSecrets:
+        - name: gitlab-registry

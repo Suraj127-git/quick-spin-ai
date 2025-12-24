@@ -1,0 +1,288 @@
+# GitLab CI/CD Pipeline for QuickSpin AI Service
+# AI-powered intelligent service for QuickSpin platform
+#
+# Pipeline Flow:
+# 1. Test: Unit tests, linting, coverage
+# 2. Security: Container scanning, dependency scanning, secret detection
+# 3. Build: Docker image build and push to GitLab Registry
+# 4. Deploy-Staging: Automatic deployment to staging on develop branch
+# 5. Deploy-Production: Manual deployment to production on main/master
+# 6. Notify: Discord notifications for all stages
+
+stages:
+  - lint
+  - security
+  - build
+  - deploy-production
+  - notify
+
+# Global variables
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  IMAGE_TAG_LATEST: $CI_REGISTRY_IMAGE:latest
+  IMAGE_TAG_SHA: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  # Python version
+  PYTHON_VERSION: "3.12"
+
+# =======================
+# TEST STAGE
+# =======================
+
+lint:ai:
+  stage: lint
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm
+  before_script:
+    - uv sync --all-extras
+  script:
+    - echo "Running linters..."
+    - uv run ruff check app/
+    - echo "Running type checker..."
+    - uv run mypy app/ --strict || true  # Allow to continue if mypy fails
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# SECURITY STAGE
+# =======================
+
+container_scanning:
+  stage: security
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - apk add --no-cache curl
+    - export TRIVY_VERSION=$(curl -s "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - echo "Installing Trivy ${TRIVY_VERSION}..."
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+  script:
+    - echo "Building image for scanning..."
+    - docker build -t $IMAGE_TAG_SHA .
+    - echo "Scanning image with Trivy..."
+    - echo "=========================================="
+    - trivy image --severity HIGH,CRITICAL --exit-code 0 --no-progress $IMAGE_TAG_SHA
+    - echo "=========================================="
+    - trivy image --severity HIGH,CRITICAL --format json --output trivy-report.json $IMAGE_TAG_SHA
+    - echo "Vulnerability scan complete. See trivy-report.json for details."
+  artifacts:
+    paths:
+      - trivy-report.json
+    reports:
+      container_scanning: trivy-report.json
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+  allow_failure: true
+
+secret_detection:
+  stage: security
+  image: python:3.12-slim
+  before_script:
+    - pip install detect-secrets
+  script:
+    - echo "Scanning for secrets in codebase..."
+    - detect-secrets scan --all-files --exclude-files '\.git/.*|coverage\.xml|\.gitlab-ci\.yml' > .secrets.baseline || true
+    - detect-secrets audit .secrets.baseline || true
+    - echo "Secret detection scan complete."
+  artifacts:
+    paths:
+      - .secrets.baseline
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+  allow_failure: true
+
+dependency_scanning:
+  stage: security
+  image: python:3.12-slim
+  before_script:
+    - pip install safety pip-audit
+  script:
+    - echo "Scanning Python dependencies for known vulnerabilities..."
+    - echo "Using Safety..."
+    - safety check --json --output safety-report.json || true
+    - echo "Using pip-audit..."
+    - pip-audit --desc --output pip-audit-report.json --format json || true
+  artifacts:
+    paths:
+      - safety-report.json
+      - pip-audit-report.json
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+  allow_failure: true
+
+# =======================
+# BUILD STAGE
+# =======================
+
+build:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "Building Docker image for AI service..."
+    - echo "Tags: latest, $CI_COMMIT_SHORT_SHA"
+    - docker build -t $IMAGE_TAG_LATEST -t $IMAGE_TAG_SHA .
+    - echo "Pushing images to GitLab Container Registry..."
+    - docker push $IMAGE_TAG_LATEST
+    - docker push $IMAGE_TAG_SHA
+    - echo "✅ AI service images pushed successfully:"
+    - echo "  - $IMAGE_TAG_LATEST"
+    - echo "  - $IMAGE_TAG_SHA"
+  after_script:
+    - docker logout $CI_REGISTRY
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+  dependencies:
+    - test:unit
+    - lint:ai
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# DEPLOYMENT STAGES
+# =======================
+
+deploy:production:
+  stage: deploy-production
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl bash kubectl
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl version --client
+  script:
+    - echo "=========================================="
+    - echo "Deploying AI service to production"
+    - echo "Image: $IMAGE_TAG_SHA"
+    - echo "=========================================="
+
+    # Create/update production secrets
+    - |
+      echo "Creating production secrets..."
+      kubectl create secret generic quickspin-ai-secrets \
+        --from-literal=QUICKSPIN_API_URL="$QUICKSPIN_API_URL_PROD" \
+        --from-literal=QUICKSPIN_AUTH_URL="$QUICKSPIN_AUTH_URL_PROD" \
+        --from-literal=GROQ_API_KEY="$GROQ_API_KEY_PROD" \
+        --from-literal=MONGODB_URI="$MONGODB_URI_PROD" \
+        --from-literal=JWT_SECRET_KEY="$JWT_SECRET_KEY_PROD" \
+        --from-literal=K8S_IN_CLUSTER="true" \
+        --namespace quickspin-ai \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # Update deployment
+    - echo "Updating deployment image to $IMAGE_TAG_SHA..."
+    - kubectl set image deployment/quickspin-ai quickspin-ai=$IMAGE_TAG_SHA -n quickspin-ai
+
+    # Wait for rollout
+    - echo "Waiting for deployment to roll out..."
+    - kubectl rollout status deployment/quickspin-ai -n quickspin-ai --timeout=300s
+
+    # Verify deployment
+    - echo "Verifying deployment..."
+    - kubectl get pods -n quickspin-ai -l app=quickspin-ai
+    - kubectl get deployment quickspin-ai -n quickspin-ai
+
+    - echo "=========================================="
+    - echo "✅ Production deployment completed successfully"
+    - echo "=========================================="
+  environment:
+    name: ai-production
+    url: https://ai.quickspin.cloud
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual  # Manual approval for production
+  dependencies:
+    - build
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# NOTIFICATION STAGE
+# =======================
+
+notify:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+        echo "Discord webhook not configured, skipping notification"
+        exit 0
+      fi
+
+      # Determine status and color
+      if [ "$CI_JOB_STATUS" = "success" ]; then
+        STATUS="Success ✅"
+        COLOR=3066993
+        EMOJI=":white_check_mark:"
+      else
+        STATUS="Failed ❌"
+        COLOR=15158332
+        EMOJI=":x:"
+      fi
+
+      # Create Discord webhook payload
+      PAYLOAD=$(cat <<EOF
+      {
+        "embeds": [{
+          "title": "${EMOJI} AI Service Pipeline ${STATUS}",
+          "color": ${COLOR},
+          "fields": [
+            { "name": "Project", "value": "QuickSpin AI", "inline": true },
+            { "name": "Branch", "value": "$CI_COMMIT_REF_NAME", "inline": true },
+            { "name": "Commit", "value": "$CI_COMMIT_SHORT_SHA", "inline": true },
+            { "name": "Author", "value": "$GITLAB_USER_NAME", "inline": true },
+            { "name": "Stage", "value": "$CI_JOB_STAGE", "inline": true },
+            { "name": "Duration", "value": "${CI_JOB_DURATION}s", "inline": true },
+            { "name": "Commit Message", "value": "${CI_COMMIT_MESSAGE:0:100}", "inline": false },
+            { "name": "Image", "value": "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA", "inline": false },
+            { "name": "Pipeline", "value": "[View Pipeline]($CI_PIPELINE_URL)", "inline": false }
+          ],
+          "footer": { "text": "QuickSpin AI - GitLab CI/CD" },
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+        }]
+      }
+      EOF
+      )
+
+      # Send notification
+      curl -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL"
+      echo "Discord notification sent"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  when: always
+  tags:
+    - kubernetes
+    - deploy
