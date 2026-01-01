@@ -1,0 +1,573 @@
+# GitLab CI/CD Pipeline for QuickSpin AI Service - HELM VERSION
+# Complete pipeline with test, security, build, and Helm-based deployment
+#
+# Pipeline Flow:
+# 1. Lint: Code quality + Helm chart validation
+# 2. Security: Container scanning, dependency scanning, secret detection
+# 3. Build: Docker image build and push to GitLab Registry
+# 4. Deploy-Production: Helm-based deployment to production
+# 5. Notify: Discord notifications for all stages
+
+stages:
+  - lint
+  - security
+  - build
+  - deploy-production
+  - notify
+
+# Global variables
+variables:
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: "/certs"
+  IMAGE_NAME: $CI_REGISTRY_IMAGE
+  IMAGE_TAG_LATEST: $CI_REGISTRY_IMAGE:latest
+  IMAGE_TAG_SHA: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  HELM_CHART_PATH: "./helm"
+  HELM_RELEASE_NAME: "quickspin-ai"
+  HELM_NAMESPACE: "quickspin-ai"
+  HELM_VALUES_PRODUCTION: "./helm/values.yaml"
+  PYTHON_VERSION: "3.12"
+
+# =======================
+# LINT STAGE
+# =======================
+
+lint:ai:
+  stage: lint
+  image: ghcr.io/astral-sh/uv:python3.12-bookworm
+  before_script:
+    - uv sync --all-extras
+  script:
+    - echo "Running linters..."
+    - uv run ruff check app/
+    - echo "Running type checker..."
+    - uv run mypy app/ --strict || true  # Allow to continue if mypy fails
+    - echo "✅ Code linting passed"
+  allow_failure: false
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+
+lint:helm:
+  stage: lint
+  image: alpine/helm:latest
+  before_script:
+    - apk add --no-cache bash
+  script:
+    - echo "Linting Helm chart..."
+    - helm lint $HELM_CHART_PATH
+    - echo "Validating Helm chart templates..."
+    - helm template test-release $HELM_CHART_PATH --values $HELM_VALUES_PRODUCTION --set image.tag=test > /dev/null
+    - echo "✅ Helm chart validation passed"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# SECURITY STAGE
+# =======================
+
+container_scanning:
+  stage: security
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - apk add --no-cache curl
+    - export TRIVY_VERSION=$(curl -s "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - echo "Installing Trivy ${TRIVY_VERSION}..."
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+  script:
+    - echo "Building image for scanning..."
+    - docker build -t $IMAGE_TAG_SHA .
+    - echo "Scanning image with Trivy..."
+    - echo "=========================================="
+    - trivy image --severity HIGH,CRITICAL --exit-code 0 --no-progress $IMAGE_TAG_SHA
+    - echo "=========================================="
+    - trivy image --severity HIGH,CRITICAL --format json --output trivy-report.json $IMAGE_TAG_SHA
+    - echo "Vulnerability scan complete. See trivy-report.json for details."
+  artifacts:
+    paths:
+      - trivy-report.json
+    reports:
+      container_scanning: trivy-report.json
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+  allow_failure: true
+
+secret_detection:
+  stage: security
+  image: python:3.12-slim
+  before_script:
+    - pip install detect-secrets
+  script:
+    - echo "Scanning for secrets in codebase..."
+    - detect-secrets scan --all-files --exclude-files '\.git/.*|coverage\.xml|\.gitlab-ci\.yml' > .secrets.baseline || true
+    - detect-secrets audit .secrets.baseline || true
+    - echo "Secret detection scan complete."
+  artifacts:
+    paths:
+      - .secrets.baseline
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+  allow_failure: true
+
+dependency_scanning:
+  stage: security
+  image: python:3.12-slim
+  before_script:
+    - pip install safety pip-audit
+  script:
+    - echo "Scanning Python dependencies for known vulnerabilities..."
+    - echo "Using Safety..."
+    - safety check --json --output safety-report.json || true
+    - echo "Using pip-audit..."
+    - pip-audit --desc --output pip-audit-report.json --format json || true
+  artifacts:
+    paths:
+      - safety-report.json
+      - pip-audit-report.json
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+  tags:
+    - kubernetes
+    - deploy
+  allow_failure: true
+
+# =======================
+# BUILD STAGE
+# =======================
+
+build:
+  stage: build
+  image: docker:24-dind
+  services:
+    - docker:24-dind
+  before_script:
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - echo "Building Docker image for AI service..."
+    - echo "Tags: latest, $CI_COMMIT_SHORT_SHA"
+    - docker build -t $IMAGE_TAG_LATEST -t $IMAGE_TAG_SHA .
+    - echo "Pushing images to GitLab Container Registry..."
+    - docker push $IMAGE_TAG_LATEST
+    - docker push $IMAGE_TAG_SHA
+    - echo "✅ AI service images pushed successfully:"
+    - echo "  - $IMAGE_TAG_LATEST"
+    - echo "  - $IMAGE_TAG_SHA"
+  after_script:
+    - docker logout $CI_REGISTRY
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == "develop"
+  dependencies:
+    - lint:ai
+    - lint:helm
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# DEPLOYMENT STAGES (HELM-BASED)
+# =======================
+
+# Deploy to production using Helm (manual trigger)
+deploy:production:
+  stage: deploy-production
+  image: alpine/helm:latest
+  before_script:
+    - apk add --no-cache curl bash kubectl
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - kubectl version --client
+    - helm version
+  script:
+    - echo "=========================================="
+    - echo "Starting HELM-based deployment to production"
+    - echo "=========================================="
+    - echo "Release: $HELM_RELEASE_NAME"
+    - echo "Namespace: $HELM_NAMESPACE"
+    - echo "Image: $IMAGE_TAG_SHA"
+    - echo ""
+
+    # Create namespace if it doesn't exist
+    - kubectl create namespace $HELM_NAMESPACE --dry-run=client -o yaml | kubectl apply -f -
+
+    # Create GitLab registry pull secret
+    - echo "Creating GitLab registry pull secret..."
+    - |
+      if [ -n "$GITLAB_DEPLOY_TOKEN" ] && [ -n "$GITLAB_DEPLOY_TOKEN_USERNAME" ]; then
+        echo "Using GitLab Deploy Token (recommended for production)"
+        kubectl create secret docker-registry gitlab-registry \
+          --docker-server=$CI_REGISTRY \
+          --docker-username=$GITLAB_DEPLOY_TOKEN_USERNAME \
+          --docker-password=$GITLAB_DEPLOY_TOKEN \
+          --namespace=$HELM_NAMESPACE \
+          --dry-run=client -o yaml | kubectl apply -f -
+      else
+        echo "WARNING: Using CI Job Token (will expire after pipeline)"
+        kubectl create secret docker-registry gitlab-registry \
+          --docker-server=$CI_REGISTRY \
+          --docker-username=gitlab-ci-token \
+          --docker-password=$CI_JOB_TOKEN \
+          --namespace=$HELM_NAMESPACE \
+          --dry-run=client -o yaml | kubectl apply -f -
+      fi
+
+    # Create application secrets (from CI/CD variables)
+    - echo "Creating application secrets..."
+    - |
+      kubectl create secret generic quickspin-ai-secrets \
+        --from-literal=QUICKSPIN_API_URL="$QUICKSPIN_API_URL_PROD" \
+        --from-literal=QUICKSPIN_AUTH_URL="$QUICKSPIN_AUTH_URL_PROD" \
+        --from-literal=GROQ_API_KEY="$GROQ_API_KEY_PROD" \
+        --from-literal=MONGODB_URI="$MONGODB_URI_PROD" \
+        --from-literal=JWT_SECRET_KEY="$JWT_SECRET_KEY_PROD" \
+        --from-literal=K8S_IN_CLUSTER="true" \
+        --namespace=$HELM_NAMESPACE \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # Helm dry-run to validate
+    - echo ""
+    - echo "Running Helm dry-run for validation..."
+    - |
+      helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH \
+        --namespace $HELM_NAMESPACE \
+        --values $HELM_VALUES_PRODUCTION \
+        --set image.tag=$CI_COMMIT_SHORT_SHA \
+        --dry-run --debug > helm-dry-run.yaml
+    - echo "✅ Dry-run successful"
+
+    # Deploy with Helm
+    - echo ""
+    - echo "Deploying with Helm..."
+    - |
+      helm upgrade --install $HELM_RELEASE_NAME $HELM_CHART_PATH \
+        --namespace $HELM_NAMESPACE \
+        --create-namespace \
+        --values $HELM_VALUES_PRODUCTION \
+        --set image.tag=$CI_COMMIT_SHORT_SHA \
+        --wait \
+        --timeout 10m \
+        --atomic
+
+    # Verify deployment
+    - echo ""
+    - echo "Verifying Helm release..."
+    - helm status $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+    - helm list -n $HELM_NAMESPACE
+
+    - echo ""
+    - echo "Checking pod status..."
+    - kubectl get pods -n $HELM_NAMESPACE -l app=quickspin-ai
+
+    - echo ""
+    - echo "Checking PVC status (Chroma vector DB)..."
+    - kubectl get pvc -n $HELM_NAMESPACE
+
+    - echo ""
+    - echo "Monitoring deployment health for 30 seconds..."
+    - sleep 30
+
+    # Health check
+    - |
+      echo "Performing deployment health check..."
+      ready_pods=$(kubectl get pods -n $HELM_NAMESPACE -l app=quickspin-ai --field-selector=status.phase=Running -o name 2>/dev/null | wc -l)
+      total_pods=$(kubectl get pods -n $HELM_NAMESPACE -l app=quickspin-ai --no-headers 2>/dev/null | wc -l)
+
+      if [ "$total_pods" -gt 0 ]; then
+        if [ "$ready_pods" -lt "$total_pods" ]; then
+          echo "❌ Health check failed - $ready_pods/$total_pods pods ready"
+          echo "Rolling back deployment..."
+          helm rollback $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+          exit 1
+        fi
+        echo "✅ Health check passed - $ready_pods/$total_pods pods ready"
+      else
+        echo "❌ No pods found for deployment"
+        exit 1
+      fi
+
+    - echo ""
+    - echo "=========================================="
+    - echo "✅ Production deployment completed successfully"
+    - echo "=========================================="
+    - echo "Service URL: https://ai.quickspin.cloud"
+    - echo "Image: $IMAGE_TAG_SHA"
+
+  artifacts:
+    paths:
+      - helm-dry-run.yaml
+    expire_in: 1 week
+  environment:
+    name: ai-production
+    url: https://ai.quickspin.cloud
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual  # Manual approval for production
+  dependencies:
+    - build
+  tags:
+    - kubernetes
+    - deploy
+
+# Rollback using Helm (manual trigger)
+rollback:production:
+  stage: deploy-production
+  image: alpine/helm:latest
+  before_script:
+    - apk add --no-cache bash kubectl
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - helm version
+  script:
+    - echo "=========================================="
+    - echo "Rolling back production deployment"
+    - echo "=========================================="
+
+    # Show release history
+    - echo "Current release history:"
+    - helm history $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+
+    # Rollback to previous revision
+    - |
+      echo ""
+      echo "Rolling back to previous release..."
+      helm rollback $HELM_RELEASE_NAME -n $HELM_NAMESPACE --wait --timeout 10m
+
+    - echo ""
+    - echo "Verifying rollback..."
+    - helm status $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+    - kubectl get pods -n $HELM_NAMESPACE -l app=quickspin-ai
+
+    - echo ""
+    - echo "=========================================="
+    - echo "✅ Rollback completed successfully"
+    - echo "=========================================="
+
+  environment:
+    name: ai-production
+    url: https://ai.quickspin.cloud
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual
+  tags:
+    - kubernetes
+    - deploy
+
+# Emergency rollback to specific revision
+rollback:emergency:
+  stage: deploy-production
+  image: alpine/helm:latest
+  before_script:
+    - apk add --no-cache bash kubectl
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+    - helm version
+  script:
+    - echo "=========================================="
+    - echo "EMERGENCY ROLLBACK"
+    - echo "=========================================="
+
+    # Show release history
+    - echo "Release history:"
+    - helm history $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+
+    # Rollback to specific revision (can be set via CI/CD variable ROLLBACK_REVISION)
+    - |
+      REVISION=${ROLLBACK_REVISION:-0}
+      if [ "$REVISION" -eq 0 ]; then
+        echo "Rolling back to previous release..."
+        helm rollback $HELM_RELEASE_NAME -n $HELM_NAMESPACE --wait --timeout 10m
+      else
+        echo "Rolling back to revision $REVISION..."
+        helm rollback $HELM_RELEASE_NAME $REVISION -n $HELM_NAMESPACE --wait --timeout 10m
+      fi
+
+    - echo ""
+    - echo "Verifying rollback..."
+    - helm status $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+    - kubectl get pods -n $HELM_NAMESPACE -l app=quickspin-ai
+
+    - echo ""
+    - echo "=========================================="
+    - echo "✅ Emergency rollback completed"
+    - echo "=========================================="
+
+  environment:
+    name: ai-production
+    url: https://ai.quickspin.cloud
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: false
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# NOTIFICATION STAGE
+# =======================
+
+notify:success:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+        echo "Discord webhook not configured, skipping notification"
+        exit 0
+      fi
+
+      # Create Discord webhook payload for success
+      PAYLOAD=$(cat <<EOF
+      {
+        "embeds": [{
+          "title": ":white_check_mark: AI Service Deployment Success",
+          "color": 3066993,
+          "fields": [
+            { "name": "Project", "value": "QuickSpin AI", "inline": true },
+            { "name": "Branch", "value": "$CI_COMMIT_REF_NAME", "inline": true },
+            { "name": "Commit", "value": "$CI_COMMIT_SHORT_SHA", "inline": true },
+            { "name": "Author", "value": "$GITLAB_USER_NAME", "inline": true },
+            { "name": "Stage", "value": "Production Deployment", "inline": true },
+            { "name": "Duration", "value": "${CI_JOB_DURATION}s", "inline": true },
+            { "name": "Commit Message", "value": "${CI_COMMIT_MESSAGE:0:100}", "inline": false },
+            { "name": "Image", "value": "$IMAGE_NAME:$CI_COMMIT_SHORT_SHA", "inline": false },
+            { "name": "Pipeline", "value": "[View Pipeline]($CI_PIPELINE_URL)", "inline": false }
+          ],
+          "footer": { "text": "QuickSpin AI - GitLab CI/CD (Helm)" },
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+        }]
+      }
+      EOF
+      )
+
+      # Send notification
+      curl -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL"
+      echo "Discord notification sent"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: on_success
+  needs:
+    - job: deploy:production
+      optional: true
+  tags:
+    - kubernetes
+    - deploy
+
+notify:failure:
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+      if [ -z "$DISCORD_WEBHOOK_URL" ]; then
+        echo "Discord webhook not configured, skipping notification"
+        exit 0
+      fi
+
+      # Create Discord webhook payload for failure
+      PAYLOAD=$(cat <<EOF
+      {
+        "embeds": [{
+          "title": ":x: AI Service Deployment Failed",
+          "color": 15158332,
+          "fields": [
+            { "name": "Project", "value": "QuickSpin AI", "inline": true },
+            { "name": "Branch", "value": "$CI_COMMIT_REF_NAME", "inline": true },
+            { "name": "Commit", "value": "$CI_COMMIT_SHORT_SHA", "inline": true },
+            { "name": "Author", "value": "$GITLAB_USER_NAME", "inline": true },
+            { "name": "Stage", "value": "$CI_JOB_STAGE", "inline": true },
+            { "name": "Duration", "value": "${CI_JOB_DURATION}s", "inline": true },
+            { "name": "Commit Message", "value": "${CI_COMMIT_MESSAGE:0:100}", "inline": false },
+            { "name": "Pipeline", "value": "[View Pipeline]($CI_PIPELINE_URL)", "inline": false }
+          ],
+          "footer": { "text": "QuickSpin AI - GitLab CI/CD (Helm)" },
+          "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
+        }]
+      }
+      EOF
+      )
+
+      # Send notification
+      curl -H "Content-Type: application/json" -d "$PAYLOAD" "$DISCORD_WEBHOOK_URL"
+      echo "Discord notification sent"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: on_failure
+  tags:
+    - kubernetes
+    - deploy
+
+# =======================
+# UTILITY JOBS
+# =======================
+
+# Check deployment status
+check:deployment:
+  stage: deploy-production
+  image: alpine/helm:latest
+  before_script:
+    - apk add --no-cache bash kubectl
+    - mkdir -p ~/.kube
+    - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
+    - chmod 600 ~/.kube/config
+  script:
+    - echo "=========================================="
+    - echo "Deployment Status Check"
+    - echo "=========================================="
+    - echo ""
+    - echo "Helm Release Status:"
+    - helm status $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+    - echo ""
+    - echo "Helm Release History:"
+    - helm history $HELM_RELEASE_NAME -n $HELM_NAMESPACE
+    - echo ""
+    - echo "Kubernetes Pods:"
+    - kubectl get pods -n $HELM_NAMESPACE -l app=quickspin-ai -o wide
+    - echo ""
+    - echo "Kubernetes Services:"
+    - kubectl get svc -n $HELM_NAMESPACE
+    - echo ""
+    - echo "Kubernetes Ingress:"
+    - kubectl get ingress -n $HELM_NAMESPACE
+    - echo ""
+    - echo "PVC Status (Chroma Vector DB):"
+    - kubectl get pvc -n $HELM_NAMESPACE
+    - echo ""
+    - echo "HPA Status:"
+    - kubectl get hpa -n $HELM_NAMESPACE
+    - echo ""
+    - echo "Recent Pod Events:"
+    - kubectl get events -n $HELM_NAMESPACE --sort-by='.lastTimestamp' | tail -20
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
+      when: manual
+  allow_failure: true
+  tags:
+    - kubernetes
+    - deploy

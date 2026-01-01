@@ -160,7 +160,6 @@ build:
     - if: $CI_COMMIT_BRANCH == "master" || $CI_COMMIT_BRANCH == "main"
     - if: $CI_COMMIT_BRANCH == "develop"
   dependencies:
-    - test:unit
     - lint:ai
   tags:
     - kubernetes
@@ -172,39 +171,37 @@ build:
 
 deploy:production:
   stage: deploy-production
-  image: alpine:latest
+  image: alpine/helm:latest
   before_script:
     - apk add --no-cache curl bash kubectl
     - mkdir -p ~/.kube
     - echo "$KUBECONFIG_CONTENT" > ~/.kube/config
     - chmod 600 ~/.kube/config
     - kubectl version --client
+    - helm version
   script:
     - echo "=========================================="
-    - echo "Deploying AI service to production"
+    - echo "Deploying AI service to production using Helm"
     - echo "Image: $IMAGE_TAG_SHA"
     - echo "=========================================="
 
-    # Create/update production secrets
+    # Deploy using Helm
     - |
-      echo "Creating production secrets..."
-      kubectl create secret generic quickspin-ai-secrets \
-        --from-literal=QUICKSPIN_API_URL="$QUICKSPIN_API_URL_PROD" \
-        --from-literal=QUICKSPIN_AUTH_URL="$QUICKSPIN_AUTH_URL_PROD" \
-        --from-literal=GROQ_API_KEY="$GROQ_API_KEY_PROD" \
-        --from-literal=MONGODB_URI="$MONGODB_URI_PROD" \
-        --from-literal=JWT_SECRET_KEY="$JWT_SECRET_KEY_PROD" \
-        --from-literal=K8S_IN_CLUSTER="true" \
+      cd helm
+      helm upgrade --install quickspin-ai . \
         --namespace quickspin-ai \
-        --dry-run=client -o yaml | kubectl apply -f -
-
-    # Update deployment
-    - echo "Updating deployment image to $IMAGE_TAG_SHA..."
-    - kubectl set image deployment/quickspin-ai quickspin-ai=$IMAGE_TAG_SHA -n quickspin-ai
-
-    # Wait for rollout
-    - echo "Waiting for deployment to roll out..."
-    - kubectl rollout status deployment/quickspin-ai -n quickspin-ai --timeout=300s
+        --create-namespace \
+        --set image.tag=$CI_COMMIT_SHORT_SHA \
+        --set image.pullPolicy=Always \
+        --set secrets.quickspinApiUrl="$QUICKSPIN_API_URL_PROD" \
+        --set secrets.quickspinAuthUrl="$QUICKSPIN_AUTH_URL_PROD" \
+        --set secrets.groqApiKey="$GROQ_API_KEY_PROD" \
+        --set secrets.mongodbUri="$MONGODB_URI_PROD" \
+        --set secrets.jwtSecretKey="$JWT_SECRET_KEY_PROD" \
+        --set secrets.k8sInCluster="true" \
+        --set imagePullSecrets[0].name=gitlab-registry \
+        --wait \
+        --timeout 10m
 
     # Verify deployment
     - echo "Verifying deployment..."

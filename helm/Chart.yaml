@@ -1,0 +1,22 @@
+apiVersion: v2
+name: quickspin-ai
+description: QuickSpin AI Service - Intelligent Service with ML Capabilities
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - quickspin
+  - ai
+  - machine-learning
+  - fastapi
+  - groq
+  - mongodb
+  - vector-database
+home: https://quickspin.cloud
+sources:
+  - https://gitlab.com/quick-spin/quick-spin-ai
+maintainers:
+  - name: QuickSpin Team
+    email: team@quickspin.cloud
+icon: https://quickspin.cloud/logo.png
+dependencies: []

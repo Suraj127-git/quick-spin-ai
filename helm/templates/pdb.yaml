@@ -1,0 +1,19 @@
+{{- if .Values.podDisruptionBudget.enabled -}}
+apiVersion: {{ include "quickspin-ai.pdb.apiVersion" . }}
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Values.deployment.name }}-pdb
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "quickspin-ai.labels" . | nindent 4 }}
+spec:
+  {{- if .Values.podDisruptionBudget.minAvailable }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- end }}
+  {{- if .Values.podDisruptionBudget.maxUnavailable }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "quickspin-ai.selectorLabels" . | nindent 6 }}
+{{- end }}

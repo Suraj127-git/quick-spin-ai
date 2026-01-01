@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: quickspin-ai
-  labels:
-    name: quickspin-ai
-    app.kubernetes.io/name: quickspin-ai
-    app.kubernetes.io/component: ai-service
-    app.kubernetes.io/part-of: quickspin

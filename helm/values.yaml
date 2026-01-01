@@ -1,0 +1,270 @@
+# Default values for quickspin-ai
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Global configuration
+global:
+  namespace: quickspin-ai
+  environment: production
+
+# Image configuration
+image:
+  registry: registry.gitlab.com
+  repository: quick-spin/quick-spin-ai
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets:
+  - name: gitlab-registry
+
+# Deployment configuration
+deployment:
+  enabled: true
+  name: quickspin-ai
+  replicaCount: 2
+
+  image:
+    repository: registry.gitlab.com/quick-spin/quick-spin-ai
+    pullPolicy: Always
+    tag: "latest"
+
+  service:
+    type: ClusterIP
+    port: 8000
+    targetPort: 8000
+    annotations: {}
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+
+  # Health check probes
+  livenessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: 8000
+    initialDelaySeconds: 30
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+  readinessProbe:
+    httpGet:
+      path: /api/v1/health
+      port: 8000
+    initialDelaySeconds: 15
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+  # Pod annotations
+  podAnnotations: {}
+
+  # Pod security context
+  podSecurityContext: {}
+
+  # Container security context
+  securityContext: {}
+
+  # Node selector
+  nodeSelector: {}
+
+  # Tolerations
+  tolerations: []
+
+  # Affinity
+  affinity: {}
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+  annotations: {}
+  sessionAffinity: ClientIP
+  sessionAffinityConfig:
+    clientIP:
+      timeoutSeconds: 10800
+
+# ServiceAccount configuration
+serviceAccount:
+  create: true
+  name: quickspin-ai
+  annotations: {}
+
+# RBAC configuration (reuse backend operator permissions)
+rbac:
+  create: false
+  useBackendServiceAccount: true
+  backendServiceAccountName: quickspin-operator
+  backendServiceAccountNamespace: quickspin-backend
+
+# Secrets configuration (values should be provided via --set or external secrets)
+secrets:
+  create: true
+  name: quickspin-ai-secrets
+  # These are placeholder keys - actual values should be injected via CI/CD
+  data: {}
+    # QUICKSPIN_API_URL: ""
+    # QUICKSPIN_AUTH_URL: ""
+    # GROQ_API_KEY: ""
+    # MONGODB_URI: ""
+    # JWT_SECRET_KEY: ""
+    # K8S_IN_CLUSTER: "true"
+
+# Persistent Volume Claim for Chroma vector database
+persistence:
+  enabled: true
+  name: quickspin-ai-chroma-pvc
+  storageClass: ""  # Use default storage class
+  accessMode: ReadWriteOnce
+  size: 10Gi
+  mountPath: /data/chroma
+  annotations: {}
+
+# Horizontal Pod Autoscaler
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 8
+  targetCPUUtilizationPercentage: 75
+  targetMemoryUtilizationPercentage: 80
+
+# Ingress configuration
+ingress:
+  enabled: true
+  className: "traefik"
+  annotations:
+    cert-manager.io/cluster-issuer: "letsencrypt-prod"
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+  hosts:
+    - host: ai.quickspin.cloud
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: quickspin-ai-tls
+      hosts:
+        - ai.quickspin.cloud
+
+# Certificate configuration (cert-manager)
+certificate:
+  enabled: true
+  name: quickspin-ai-cert
+  secretName: quickspin-ai-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  dnsNames:
+    - ai.quickspin.cloud
+
+# Network Policy
+networkPolicy:
+  enabled: false
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            name: quickspin-backend
+      - namespaceSelector:
+          matchLabels:
+            name: traefik
+      ports:
+      - protocol: TCP
+        port: 8000
+  egress:
+    - to:
+      - namespaceSelector: {}
+      ports:
+      - protocol: TCP
+        port: 27017  # MongoDB
+      - protocol: TCP
+        port: 443    # HTTPS
+      - protocol: TCP
+        port: 80     # HTTP
+      - protocol: UDP
+        port: 53     # DNS
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Strategy for deployments
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+# Environment variables (non-sensitive)
+env:
+  - name: APP_ENV
+    value: "production"
+  - name: LOG_LEVEL
+    value: "INFO"
+  - name: API_PREFIX
+    value: "/api/v1"
+  - name: HOST
+    value: "0.0.0.0"
+  - name: PORT
+    value: "8000"
+  - name: WORKERS
+    value: "2"
+  - name: GROQ_MODEL
+    value: "mixtral-8x7b-32768"
+  - name: CHROMA_PERSIST_DIR
+    value: "/data/chroma"
+  - name: CHROMA_COLLECTION_NAME
+    value: "quickspin_knowledge"
+  - name: MONGODB_DATABASE
+    value: "quickspin_ai"
+  - name: JWT_ALGORITHM
+    value: "HS256"
+  - name: PYTHONUNBUFFERED
+    value: "1"
+  - name: TZ
+    value: "UTC"
+
+# Additional environment variables from Secrets
+envFromSecrets:
+  - name: QUICKSPIN_API_URL
+    key: QUICKSPIN_API_URL
+  - name: QUICKSPIN_AUTH_URL
+    key: QUICKSPIN_AUTH_URL
+  - name: GROQ_API_KEY
+    key: GROQ_API_KEY
+  - name: MONGODB_URI
+    key: MONGODB_URI
+  - name: JWT_SECRET_KEY
+    key: JWT_SECRET_KEY
+  - name: K8S_IN_CLUSTER
+    key: K8S_IN_CLUSTER
+
+# Additional volumes
+volumes: []
+
+# Additional volume mounts
+volumeMounts: []
+
+# Init containers
+initContainers: []
+
+# Sidecar containers
+sidecars: []
+
+# Monitoring and observability
+monitoring:
+  enabled: true
+  prometheus:
+    enabled: true
+    port: 8000
+    path: /metrics
